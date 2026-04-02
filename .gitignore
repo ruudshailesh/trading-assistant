@@ -1,0 +1,21 @@
+# Secrets — never upload
+.env
+
+# Database files
+data/
+*.db
+
+# Logs
+logs/
+*.log
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS files
+.DS_Store
+Thumbs.db
