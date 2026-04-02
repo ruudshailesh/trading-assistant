@@ -94,7 +94,7 @@ def fetch_ohlcv_batch(
         return {}
 
     results: Dict[str, pd.DataFrame] = {}
-    chunk_size = 200
+    chunk_size = 50  # smaller chunks more reliable on cloud hosting
 
     for chunk_start in range(0, len(tickers), chunk_size):
         chunk = tickers[chunk_start : chunk_start + chunk_size]
@@ -272,31 +272,42 @@ def load_all_data(
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any], str]:
     """
     Master function called by scoring.py.
-    1. Fetches OHLCV for all universe tickers + SPY in one batch
-    2. Extracts SPY to compute market context
-    3. Persists SPY context to DB
-
-    Returns:
-        ohlcv      : {ticker: DataFrame}  (SPY excluded — handled separately)
-        spy_ctx    : market context dict
-        timestamp  : human-readable freshness string for UI
+    Fetches OHLCV for all tickers + SPY.
+    Retries with smaller chunks if large batch fails.
+    Returns cached SPY context from DB if all fetches fail.
     """
     all_tickers = list(set(tickers + ["SPY"]))
     app_logger.info("load_all_data: fetching %d tickers...", len(all_tickers))
 
+    # Try full batch first, then fall back to smaller chunks
     ohlcv = fetch_ohlcv_batch(all_tickers)
 
-    # Extract SPY for context — don't pass to scoring
-    spy_df = ohlcv.pop("SPY", None)
+    # If full batch returned nothing, retry in chunks of 50
+    if not ohlcv:
+        app_logger.warning("Full batch returned empty — retrying in chunks of 50...")
+        ohlcv = {}
+        for i in range(0, len(all_tickers), 50):
+            chunk = all_tickers[i:i+50]
+            chunk_result = fetch_ohlcv_batch(chunk, period="60d")
+            ohlcv.update(chunk_result)
+            if chunk_result:
+                app_logger.info("Chunk %d: got %d tickers", i//50, len(chunk_result))
+
+    # If still nothing, try a minimal set of the most liquid tickers
+    if not ohlcv:
+        app_logger.warning("Chunks also failed — trying minimal set of 10 tickers...")
+        minimal = ["AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","JPM","V","SPY"]
+        ohlcv = fetch_ohlcv_batch(minimal, period="60d")
+
+    # Extract SPY for context
+    spy_df  = ohlcv.pop("SPY", None)
     spy_ctx = fetch_and_store_spy_context(spy_df)
 
     timestamp = (
         f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
         f"(~{config.DATA_DELAY_MINUTES} min delay)"
     )
-    app_logger.info(
-        "load_all_data: complete. %d tickers with valid data.", len(ohlcv)
-    )
+    app_logger.info("load_all_data: complete. %d tickers loaded.", len(ohlcv))
     return ohlcv, spy_ctx, timestamp
 
 
