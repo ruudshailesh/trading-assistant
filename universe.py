@@ -286,48 +286,73 @@ def _apply_filter_b(info: Dict[str, Dict], fa_tickers: set) -> List[Dict]:
     return out
 
 
+def _build_static_universe() -> list:
+    """Build universe from static lists — no network calls. Always works."""
+    rows = []
+    for ticker in FILTER_A_TICKERS:
+        rows.append({"ticker": ticker, "strategy": "filter_a",
+                     "sector": SECTOR_MAP.get(ticker, "Unknown"),
+                     "market_cap": 0, "avg_volume": 0, "price": 0})
+    fa_set = {r["ticker"] for r in rows}
+    for ticker in FILTER_B_SEED:
+        if ticker not in fa_set:
+            rows.append({"ticker": ticker, "strategy": "filter_b",
+                         "sector": SECTOR_MAP.get(ticker, "Unknown"),
+                         "market_cap": 0, "avg_volume": 0, "price": 0})
+    return rows
+
+
 def refresh_universe(
-    progress_callback: Optional[Callable[[str], None]] = None,
-) -> Tuple[bool, str]:
+    progress_callback=None,
+):
     """
-    Fast universe refresh using single batch download.
-    Expected time: 15-30 seconds (vs 5+ minutes before).
+    Universe refresh with automatic static fallback.
+    If yfinance is blocked/slow, falls back to static list instantly.
+    Live prices are always fetched fresh during daily scoring anyway.
     """
-    def prog(msg: str):
+    def prog(msg):
         app_logger.info("refresh_universe: %s", msg)
         if progress_callback:
             progress_callback(msg)
 
+    def save(rows, source):
+        df = pd.DataFrame(rows)
+        df["last_updated"] = datetime.now().isoformat(timespec="seconds")
+        df.to_csv(config.UNIVERSE_CSV, index=False)
+        fa = sum(1 for r in rows if r["strategy"] == "filter_a")
+        fb = sum(1 for r in rows if r["strategy"] == "filter_b")
+        note = "" if source == "live" else " (static list — live prices load at scoring time)"
+        return True, f"Universe ready: {fa} Filter A + {fb} Filter B = {len(rows)} tickers{note}"
+
     try:
-        all_candidates = list(set(FILTER_A_TICKERS + FILTER_B_SEED))
-        prog(f"Step 1/3 — Fetching price & volume for {len(all_candidates)} tickers...")
+        candidates = list(set(FILTER_A_TICKERS + FILTER_B_SEED))
+        prog(f"Fetching data for {len(candidates)} tickers...")
 
-        info = _fetch_price_volume_batch(all_candidates)
-        prog(f"Step 2/3 — Got data for {len(info)} tickers. Applying filters...")
+        info = _fetch_price_volume_batch(candidates)
 
-        fa_rows = _apply_filter_a(info)
-        fa_set  = {r["ticker"] for r in fa_rows}
-        fb_rows = _apply_filter_b(info, fa_set)
+        if not info:
+            prog("Live fetch unavailable — using static list...")
+            return save(_build_static_universe(), "static")
+
+        fa_rows  = _apply_filter_a(info)
+        fa_set   = {r["ticker"] for r in fa_rows}
+        fb_rows  = _apply_filter_b(info, fa_set)
         all_rows = fa_rows + fb_rows
 
         if not all_rows:
-            return False, "No tickers passed filters. Check internet connection."
+            prog("No tickers passed live filters — using static fallback...")
+            return save(_build_static_universe(), "static")
 
-        df = pd.DataFrame(all_rows)
-        df["last_updated"] = datetime.now().isoformat(timespec="seconds")
-        df.to_csv(config.UNIVERSE_CSV, index=False)
-
-        msg = (
-            f"Universe refreshed in seconds: "
-            f"{len(fa_rows)} Filter A + {len(fb_rows)} Filter B = {len(all_rows)} total."
-        )
-        prog(f"Step 3/3 — {msg}")
-        return True, msg
+        return save(all_rows, "live")
 
     except Exception as e:
-        msg = f"Universe refresh failed: {e}"
-        logger.error("%s\n%s", msg, traceback.format_exc())
-        return False, msg
+        logger.error("refresh_universe error: %s", e)
+        try:
+            prog(f"Error ({e}) — falling back to static list...")
+            return save(_build_static_universe(), "static")
+        except Exception as e2:
+            return False, f"Refresh failed: {e2}"
+
 
 
 # ── Read helpers ──────────────────────────────────────────────────────────────
